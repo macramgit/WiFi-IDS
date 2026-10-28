@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# AWS certificates / private keys
+certs/
+*.pem
+*.key
+*.crt
+
+# Local event logs
+events.jsonl
+baseline_*.jsonl
+
+# Experimental measurements
+performance_*.txt
+*_debug.txt
+
+# Local backups
+*_backup.py
+*_before_*.py
+
+# Environment / secrets
+.env
+*.env
+
+# Editor
+*.swp
+*~
