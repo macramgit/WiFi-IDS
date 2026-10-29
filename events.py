@@ -3,14 +3,15 @@ from datetime import datetime, timezone
 
 from config import SENSOR_ID, EVENT_LOG
 from mqtt_transport import publish_event
-
+import uuid
 
 SCHEMA_VERSION = "1.0"
 
 
 def create_event(event_type, severity, **data):
     event = {
-        "schema_version": SCHEMA_VERSION,
+        "uuid": str(uuid.uuid4()),
+	"schema_version": SCHEMA_VERSION,
         "sensor_id": SENSOR_ID,
         "timestamp": datetime.now(
             timezone.utc
