@@ -10,7 +10,7 @@ SCHEMA_VERSION = "1.0"
 
 def create_event(event_type, severity, **data):
     event = {
-        "uuid": str(uuid.uuid4()),
+        "event_id": str(uuid.uuid4()),
 	"schema_version": SCHEMA_VERSION,
         "sensor_id": SENSOR_ID,
         "timestamp": datetime.now(
