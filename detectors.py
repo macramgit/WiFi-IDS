@@ -5,6 +5,7 @@ from scapy.layers.dot11 import (
     Dot11,
     Dot11Elt,
     Dot11Beacon,
+    Dot11ProbeReq,
     Dot11ProbeResp,
     Dot11Deauth,
     Dot11Disas,
@@ -17,9 +18,7 @@ from config import (
     ALERT_COOLDOWN,
     TRUSTED_APS,
     TRUSTED_AP_PROFILES,
-    EVENT_LOG,
 )
-
 from events import create_event, emit_event
 
 
@@ -29,96 +28,105 @@ probe_events = defaultdict(deque)
 last_deauth_alert = {}
 last_probe_alert = {}
 last_rogue_alert = {}
-last_mac_anomaly_alert = {}
+last_mac_alert = {}
+
+BROADCAST_MAC = "ff:ff:ff:ff:ff:ff"
 
 
-def normalize_mac(mac):
-    if not mac:
+def normalize_mac(value):
+    if not value:
         return None
-
-    return mac.lower()
+    return str(value).lower()
 
 
 def get_ssid(packet):
-    element = packet.getlayer(Dot11Elt)
+    elt = packet.getlayer(Dot11Elt)
 
-    while element is not None:
-        if getattr(element, "ID", None) == 0:
-            try:
-                return element.info.decode(
-                    "utf-8",
-                    errors="replace",
-                )
-            except Exception:
-                return ""
+    while elt is not None:
+        if getattr(elt, "ID", None) == 0:
+            raw = getattr(elt, "info", b"")
 
-        element = element.payload.getlayer(
-            Dot11Elt
-        )
+            if isinstance(raw, bytes):
+                return raw.decode("utf-8", errors="ignore")
+
+            return str(raw)
+
+        payload = getattr(elt, "payload", None)
+        if payload is None:
+            break
+
+        elt = payload.getlayer(Dot11Elt)
 
     return None
 
 
 def get_advertised_channel(packet):
-    element = packet.getlayer(Dot11Elt)
+    elt = packet.getlayer(Dot11Elt)
 
-    while element is not None:
-        if getattr(element, "ID", None) == 3:
+    while elt is not None:
+        if getattr(elt, "ID", None) == 3:
+            raw = getattr(elt, "info", b"")
+
+            if isinstance(raw, bytes) and raw:
+                return int(raw[0])
+
             try:
-                if element.info:
-                    return int(element.info[0])
-            except Exception:
+                return int(raw)
+            except (TypeError, ValueError):
                 return None
 
-        element = element.payload.getlayer(
-            Dot11Elt
-        )
+        payload = getattr(elt, "payload", None)
+        if payload is None:
+            break
+
+        elt = payload.getlayer(Dot11Elt)
 
     return None
 
 
-def frequency_to_channel(frequency):
-    if not frequency:
+def frequency_to_channel(freq):
+    if freq is None:
         return None
 
     try:
-        frequency = int(frequency)
+        freq = int(freq)
     except (TypeError, ValueError):
         return None
 
-    if frequency == 2484:
+    if freq == 2484:
         return 14
 
-    if 2412 <= frequency <= 2472:
-        return (frequency - 2407) // 5
+    if 2412 <= freq <= 2472:
+        return (freq - 2407) // 5
 
-    if 5000 <= frequency <= 5900:
-        return (frequency - 5000) // 5
+    if 5000 <= freq <= 5900:
+        return (freq - 5000) // 5
 
     return None
 
 
 def get_capture_channel(packet):
-    frequency = getattr(
-        packet,
-        "ChannelFrequency",
-        None,
-    )
+    radiotap = packet.getlayer("RadioTap")
 
-    return frequency_to_channel(frequency)
+    if radiotap is None:
+        return None
+
+    freq = getattr(radiotap, "ChannelFrequency", None)
+    return frequency_to_channel(freq)
 
 
 def get_radio_info(packet):
-    channel = get_advertised_channel(packet)
+    radiotap = packet.getlayer("RadioTap")
 
-    if channel is None:
-        channel = get_capture_channel(packet)
+    if radiotap is None:
+        return {
+            "rssi": None,
+            "frequency": None,
+            "capture_channel": None,
+        }
 
-    rssi = getattr(
-        packet,
-        "dBm_AntSignal",
-        None,
-    )
+    rssi = getattr(radiotap, "dBm_AntSignal", None)
+    frequency = getattr(radiotap, "ChannelFrequency", None)
 
     try:
         if rssi is not None:
@@ -126,7 +134,17 @@ def get_radio_info(packet):
     except (TypeError, ValueError):
         rssi = None
 
-    return channel, rssi
+    try:
+        if frequency is not None:
+            frequency = int(frequency)
+    except (TypeError, ValueError):
+        frequency = None
+
+    return {
+        "rssi": rssi,
+        "frequency": frequency,
+        "capture_channel": frequency_to_channel(frequency),
+    }
 
 
 def get_frame_type(packet):
@@ -135,6 +153,9 @@ def get_frame_type(packet):
 
     if packet.haslayer(Dot11ProbeResp):
         return "Probe Response"
+
+    if packet.haslayer(Dot11ProbeReq):
+        return "Probe Request"
 
     if packet.haslayer(Dot11Deauth):
         return "Deauthentication"
@@ -146,589 +167,406 @@ def get_frame_type(packet):
 
 
 def get_immediate_detection_latency_ms(packet):
-    packet_time = getattr(
-        packet,
-        "time",
-        None,
-    )
+    packet_time = getattr(packet, "time", None)
 
     if packet_time is None:
         return None
 
     try:
-        latency = (
-            time() - float(packet_time)
-        ) * 1000
-
-        return round(
-            max(latency, 0),
-            2,
-        )
-
+        latency = (time() - float(packet_time)) * 1000
+        return round(max(latency, 0), 2)
     except (TypeError, ValueError):
         return None
 
 
-def detect_deauth_flood(packet):
-    if not packet.haslayer(Dot11):
-        return
+def get_sequence_number(packet):
+    dot11 = packet.getlayer(Dot11)
 
-    if not (
-        packet.haslayer(Dot11Deauth)
-        or packet.haslayer(Dot11Disas)
-    ):
-        return
+    if dot11 is None:
+        return None
 
-    dot11 = packet[Dot11]
+    sc = getattr(dot11, "SC", None)
 
-    source_mac = normalize_mac(
-        dot11.addr2
+    if sc is None:
+        return None
+
+    try:
+        return (int(sc) >> 4) & 0x0FFF
+    except (TypeError, ValueError):
+        return None
+
+
+def get_fragment_number(packet):
+    dot11 = packet.getlayer(Dot11)
+
+    if dot11 is None:
+        return None
+
+    sc = getattr(dot11, "SC", None)
+
+    if sc is None:
+        return None
+
+    try:
+        return int(sc) & 0x000F
+    except (TypeError, ValueError):
+        return None
+
+
+def make_frame_identity(packet):
+    """
+    Identyfikator logicznej ramki 802.11 używany tylko do odrzucania
+    retransmisji/duplikatów widzianych przez sensor.
+    """
+    seq = get_sequence_number(packet)
+    frag = get_fragment_number(packet)
+
+    if seq is None:
+        return None
+
+    dot11 = packet.getlayer(Dot11)
+
+    return (
+        normalize_mac(getattr(dot11, "addr1", None)),
+        normalize_mac(getattr(dot11, "addr2", None)),
+        normalize_mac(getattr(dot11, "addr3", None)),
+        seq,
+        frag,
+        int(getattr(dot11, "subtype", -1)),
     )
 
-    destination_mac = normalize_mac(
-        dot11.addr1
-    )
 
-    bssid = normalize_mac(
-        dot11.addr3
-    )
-
-    if not bssid:
-        bssid = source_mac
-
-    if not bssid:
-        return
-
-    reason = None
-
-    if packet.haslayer(Dot11Deauth):
-        reason = getattr(
-            packet[Dot11Deauth],
-            "reason",
-            None,
-        )
-
-    elif packet.haslayer(Dot11Disas):
-        reason = getattr(
-            packet[Dot11Disas],
-            "reason",
-            None,
-        )
-
-    now = monotonic()
-
-    events = deauth_events[bssid]
-    events.append(now)
-
-    while (
-        events
-        and now - events[0]
-        > WINDOW_SECONDS
-    ):
+def prune_queue(events, now):
+    while events and now - events[0][0] > WINDOW_SECONDS:
         events.popleft()
 
+
+def queue_contains_identity(events, identity):
+    if identity is None:
+        return False
+
+    return any(item[1] == identity for item in events)
+
+
+def detect_probe_flood(packet):
+    if not packet.haslayer(Dot11ProbeReq):
+        return
+
+    dot11 = packet.getlayer(Dot11)
+    source = normalize_mac(getattr(dot11, "addr2", None))
+
+    if not source:
+        return
+
+    ssid = get_ssid(packet)
+    if ssid is None:
+        ssid = ""
+
+    # Klucz per klient + szukane SSID.
+    # Normalny klient często szybko sprawdza wiele różnych zapamiętanych SSID.
+    # Flood testowy zwykle powtarza wiele ramek dla tego samego SSID.
+    key = (source, ssid)
+
+    now = monotonic()
+    events = probe_events[key]
+    prune_queue(events, now)
+
+    identity = make_frame_identity(packet)
+
+    # Ta sama logiczna ramka może zostać odebrana wielokrotnie jako retransmisja.
+    if queue_contains_identity(events, identity):
+        return
+
+    events.append((now, identity))
+
+    count = len(events)
+
     print(
-        f"[DEAUTH] "
-        f"src={source_mac} "
-        f"dst={destination_mac} "
-        f"bssid={bssid} "
-        f"reason={reason} "
-        f"count={len(events)}/"
-        f"{DEAUTH_THRESHOLD}"
+        f"[PROBE] source={source} "
+        f"ssid={ssid if ssid else '<wildcard>'} "
+        f"count={count}/{PROBE_THRESHOLD}"
     )
 
-    if len(events) < DEAUTH_THRESHOLD:
+    if count < PROBE_THRESHOLD:
         return
 
-    previous_alert = (
-        last_deauth_alert.get(
-            bssid,
-            0,
-        )
-    )
+    last_alert = last_probe_alert.get(key, 0)
 
-    if (
-        now - previous_alert
-        < ALERT_COOLDOWN
-    ):
+    if now - last_alert < ALERT_COOLDOWN:
         return
 
-    last_deauth_alert[bssid] = now
+    last_probe_alert[key] = now
 
-    detection_latency_ms = round(
-        (now - events[0]) * 1000,
-        2,
+    detection_latency_ms = round((now - events[0][0]) * 1000, 2)
+    radio = get_radio_info(packet)
+
+    event = create_event(
+        "PROBE_FLOOD",
+        "medium",
+        source_mac=source,
+        ssid=ssid,
+        frame_count=count,
+        threshold=PROBE_THRESHOLD,
+        window_seconds=WINDOW_SECONDS,
+        rssi=radio["rssi"],
+        frequency=radio["frequency"],
+        channel=radio["capture_channel"],
+        detection_latency_ms=detection_latency_ms,
     )
+
+    emit_event(event)
+
+    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    print("[ALERT] Podejrzenie Probe Flood")
+    print(f"Źródło: {source}")
+    print(f"SSID: {ssid if ssid else '<wildcard>'}")
+    print(f"Unikalne ramki: {count}/{PROBE_THRESHOLD}")
+    print(f"Detection latency: {detection_latency_ms} ms")
+    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+
+
+def detect_deauth_flood(packet):
+    if not (packet.haslayer(Dot11Deauth) or packet.haslayer(Dot11Disas)):
+        return
+
+    dot11 = packet.getlayer(Dot11)
+
+    source = normalize_mac(getattr(dot11, "addr2", None))
+    destination = normalize_mac(getattr(dot11, "addr1", None))
+    bssid = normalize_mac(getattr(dot11, "addr3", None))
+
+    if not bssid:
+        return
+
+    # Liczymy wyłącznie ramki wyglądające na wysłane przez AP/BSSID.
+    # Zapobiega to podwójnemu liczeniu par ramek AP->STA i STA->AP
+    # generowanych podczas niektórych testów Deauth.
+    if source != bssid:
+        return
+
+    target = destination or BROADCAST_MAC
+    key = (bssid, target)
+
+    now = monotonic()
+    events = deauth_events[key]
+    prune_queue(events, now)
+
+    identity = make_frame_identity(packet)
+
+    if queue_contains_identity(events, identity):
+        return
+
+    events.append((now, identity))
+
+    count = len(events)
+
+    print(
+        f"[DEAUTH] bssid={bssid} "
+        f"target={target} "
+        f"count={count}/{DEAUTH_THRESHOLD}"
+    )
+
+    if count < DEAUTH_THRESHOLD:
+        return
+
+    last_alert = last_deauth_alert.get(key, 0)
+
+    if now - last_alert < ALERT_COOLDOWN:
+        return
+
+    last_deauth_alert[key] = now
+
+    detection_latency_ms = round((now - events[0][0]) * 1000, 2)
+    radio = get_radio_info(packet)
 
     event = create_event(
         "DEAUTH_FLOOD",
         "high",
         bssid=bssid,
-        source_mac=source_mac,
-        destination_mac=destination_mac,
-        reason=reason,
-        frame_count=len(events),
+        source_mac=source,
+        destination_mac=target,
+        frame_type=get_frame_type(packet),
+        frame_count=count,
+        threshold=DEAUTH_THRESHOLD,
         window_seconds=WINDOW_SECONDS,
-        detection_latency_ms=(
-            detection_latency_ms
-        ),
+        rssi=radio["rssi"],
+        frequency=radio["frequency"],
+        channel=radio["capture_channel"],
+        detection_latency_ms=detection_latency_ms,
     )
 
     emit_event(event)
 
-    print()
-    print("!" * 70)
-    print(
-        "[ALERT] Podejrzenie ataku "
-        "deauthentication"
-    )
-    print(
-        f"BSSID: {bssid}"
-    )
-    print(
-        "Liczba ramek "
-        "deauthentication/disassociation: "
-        f"{len(events)} "
-        f"w czasie {WINDOW_SECONDS} s"
-    )
-    print(
-        "Detection latency: "
-        f"{detection_latency_ms} ms"
-    )
-    print(
-        "Zdarzenie zapisano do: "
-        f"{EVENT_LOG}"
-    )
-    print("!" * 70)
-    print()
-
-
-def detect_probe_flood(packet):
-    if not packet.haslayer(Dot11):
-        return
-
-    dot11 = packet[Dot11]
-
-    if (
-        dot11.type != 0
-        or dot11.subtype != 4
-    ):
-        return
-
-    source_mac = normalize_mac(
-        dot11.addr2
-    )
-
-    if not source_mac:
-        return
-
-    now = monotonic()
-
-    events = probe_events[source_mac]
-    events.append(now)
-
-    while (
-        events
-        and now - events[0]
-        > WINDOW_SECONDS
-    ):
-        events.popleft()
-
-    ssid = get_ssid(packet)
-
-    print(
-        f"[PROBE] "
-        f"src={source_mac} "
-        f"ssid={ssid!r} "
-        f"count={len(events)}/"
-        f"{PROBE_THRESHOLD}"
-    )
-
-    if len(events) < PROBE_THRESHOLD:
-        return
-
-    previous_alert = (
-        last_probe_alert.get(
-            source_mac,
-            0,
-        )
-    )
-
-    if (
-        now - previous_alert
-        < ALERT_COOLDOWN
-    ):
-        return
-
-    last_probe_alert[source_mac] = now
-
-    detection_latency_ms = round(
-        (now - events[0]) * 1000,
-        2,
-    )
-
-    channel, rssi = get_radio_info(
-        packet
-    )
-
-    event = create_event(
-        "PROBE_FLOOD",
-        "medium",
-        source_mac=source_mac,
-        ssid=ssid,
-        channel=channel,
-        rssi=rssi,
-        frame_count=len(events),
-        window_seconds=WINDOW_SECONDS,
-        detection_latency_ms=(
-            detection_latency_ms
-        ),
-    )
-
-    emit_event(event)
-
-    print()
-    print("!" * 70)
-    print(
-        "[ALERT] Podejrzenie ataku "
-        "Probe Flood"
-    )
-    print(
-        f"Source MAC: {source_mac}"
-    )
-    print(
-        "Liczba ramek Probe Request: "
-        f"{len(events)} "
-        f"w czasie {WINDOW_SECONDS} s"
-    )
-    print(
-        "Detection latency: "
-        f"{detection_latency_ms} ms"
-    )
-    print(
-        "Zdarzenie zapisano do: "
-        f"{EVENT_LOG}"
-    )
-    print("!" * 70)
-    print()
+    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    print("[ALERT] Podejrzenie Deauthentication / Disassociation Flood")
+    print(f"BSSID: {bssid}")
+    print(f"Cel: {target}")
+    print(f"Unikalne ramki AP->cel: {count}/{DEAUTH_THRESHOLD}")
+    print(f"Detection latency: {detection_latency_ms} ms")
+    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 
 
 def detect_rogue_ap(packet):
-    if not packet.haslayer(Dot11):
+    if not (packet.haslayer(Dot11Beacon) or packet.haslayer(Dot11ProbeResp)):
         return
 
-    if not (
-        packet.haslayer(Dot11Beacon)
-        or packet.haslayer(Dot11ProbeResp)
-    ):
-        return
+    dot11 = packet.getlayer(Dot11)
+    bssid = normalize_mac(getattr(dot11, "addr3", None))
 
-    dot11 = packet[Dot11]
+    if not bssid:
+        return
 
     ssid = get_ssid(packet)
 
-    if not ssid:
+    if ssid is None or ssid not in TRUSTED_APS:
         return
 
-    if ssid not in TRUSTED_APS:
-        return
-
-    bssid = normalize_mac(
-        dot11.addr3
-    )
-
-    if not bssid:
-        bssid = normalize_mac(
-            dot11.addr2
-        )
-
-    if not bssid:
-        return
-
-    trusted_bssids = {
-        normalize_mac(mac)
-        for mac
-        in TRUSTED_APS[ssid]
-    }
+    trusted_bssids = {normalize_mac(x) for x in TRUSTED_APS.get(ssid, set())}
 
     if bssid in trusted_bssids:
         return
 
     now = monotonic()
+    key = (ssid, bssid)
 
-    alert_key = (
-        ssid,
-        bssid,
-    )
-
-    previous_alert = (
-        last_rogue_alert.get(
-            alert_key,
-            0,
-        )
-    )
-
-    if (
-        now - previous_alert
-        < ALERT_COOLDOWN
-    ):
+    if now - last_rogue_alert.get(key, 0) < ALERT_COOLDOWN:
         return
 
-    last_rogue_alert[
-        alert_key
-    ] = now
+    last_rogue_alert[key] = now
 
-    channel, rssi = get_radio_info(
-        packet
-    )
-
-    source_mac = normalize_mac(
-        dot11.addr2
-    )
-
-    frame_type = get_frame_type(
-        packet
-    )
-
-    detection_latency_ms = (
-        get_immediate_detection_latency_ms(
-            packet
-        )
-    )
+    radio = get_radio_info(packet)
+    advertised_channel = get_advertised_channel(packet)
+    detection_latency_ms = get_immediate_detection_latency_ms(packet)
 
     event = create_event(
         "ROGUE_AP",
         "high",
         ssid=ssid,
         bssid=bssid,
-        source_mac=source_mac,
-        frame_type=frame_type,
-        channel=channel,
-        rssi=rssi,
-        trusted_bssids=sorted(
-            trusted_bssids
-        ),
-        detection_latency_ms=(
-            detection_latency_ms
-        ),
+        trusted_bssids=sorted(trusted_bssids),
+        frame_type=get_frame_type(packet),
+        advertised_channel=advertised_channel,
+        capture_channel=radio["capture_channel"],
+        frequency=radio["frequency"],
+        rssi=radio["rssi"],
+        detection_latency_ms=detection_latency_ms,
     )
 
     emit_event(event)
 
-    print()
-    print("!" * 70)
-    print(
-        "[ALERT] Podejrzenie "
-        "Rogue AP / Evil Twin"
-    )
-    print(
-        f"SSID: {ssid}"
-    )
-    print(
-        f"Nieznany BSSID: {bssid}"
-    )
-    print(
-        "Zaufane BSSID: "
-        f"{', '.join(sorted(trusted_bssids))}"
-    )
-    print(
-        f"Typ ramki: {frame_type}"
-    )
-    print(
-        "Detection latency: "
-        f"{detection_latency_ms} ms"
-    )
-    print(
-        "Zdarzenie zapisano do: "
-        f"{EVENT_LOG}"
-    )
-    print("!" * 70)
-    print()
+    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    print("[ALERT] Podejrzenie Rogue AP / Evil Twin")
+    print(f"SSID: {ssid}")
+    print(f"Nieznany BSSID: {bssid}")
+    print(f"Zaufane BSSID: {', '.join(sorted(trusted_bssids))}")
+    print(f"Typ ramki: {get_frame_type(packet)}")
+
+    if detection_latency_ms is not None:
+        print(f"Detection latency: {detection_latency_ms} ms")
+
+    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 
 
 def detect_mac_identity_anomaly(packet):
-    if not packet.haslayer(Dot11):
+    if not (packet.haslayer(Dot11Beacon) or packet.haslayer(Dot11ProbeResp)):
         return
 
-    if not (
-        packet.haslayer(Dot11Beacon)
-        or packet.haslayer(Dot11ProbeResp)
-    ):
-        return
-
-    dot11 = packet[Dot11]
-
-    bssid = normalize_mac(
-        dot11.addr3
-    )
-
-    if not bssid:
-        bssid = normalize_mac(
-            dot11.addr2
-        )
+    dot11 = packet.getlayer(Dot11)
+    bssid = normalize_mac(getattr(dot11, "addr3", None))
 
     if not bssid:
         return
 
-    profiles = {
+    trusted_profiles = {
         normalize_mac(mac): profile
-        for mac, profile
-        in TRUSTED_AP_PROFILES.items()
+        for mac, profile in TRUSTED_AP_PROFILES.items()
     }
 
-    profile = profiles.get(
-        bssid
-    )
+    profile = trusted_profiles.get(bssid)
 
     if profile is None:
         return
 
-    expected_ssid = profile.get(
-        "ssid"
-    )
+    expected_ssid = profile.get("ssid")
+    expected_channel = profile.get("channel")
 
-    expected_channel = profile.get(
-        "channel"
-    )
+    observed_ssid = get_ssid(packet)
+    advertised_channel = get_advertised_channel(packet)
 
-    observed_ssid = get_ssid(
-        packet
-    )
+    radio = get_radio_info(packet)
+    capture_channel = radio["capture_channel"]
 
-    observed_channel = (
-        get_advertised_channel(
-            packet
-        )
-    )
+    observed_channel = advertised_channel
+    if observed_channel is None:
+        observed_channel = capture_channel
 
-    capture_channel = (
-        get_capture_channel(
-            packet
-        )
-    )
-
-    _, rssi = get_radio_info(
-        packet
-    )
-
-    anomalies = []
-
-    if (
+    ssid_mismatch = (
         expected_ssid is not None
         and observed_ssid is not None
-        and observed_ssid
-        != expected_ssid
-    ):
-        anomalies.append(
-            "ssid"
-        )
+        and observed_ssid != expected_ssid
+    )
 
-    if (
+    channel_mismatch = (
         expected_channel is not None
         and observed_channel is not None
-        and observed_channel
-        != expected_channel
-    ):
-        anomalies.append(
-            "channel"
-        )
+        and observed_channel != expected_channel
+    )
 
-    if not anomalies:
+    if not (ssid_mismatch or channel_mismatch):
         return
 
     now = monotonic()
-
-    alert_key = (
+    key = (
         bssid,
-        tuple(anomalies),
         observed_ssid,
         observed_channel,
     )
 
-    previous_alert = (
-        last_mac_anomaly_alert.get(
-            alert_key,
-            0,
-        )
-    )
-
-    if (
-        now - previous_alert
-        < ALERT_COOLDOWN
-    ):
+    if now - last_mac_alert.get(key, 0) < ALERT_COOLDOWN:
         return
 
-    last_mac_anomaly_alert[
-        alert_key
-    ] = now
+    last_mac_alert[key] = now
 
-    source_mac = normalize_mac(
-        dot11.addr2
-    )
-
-    frame_type = get_frame_type(
-        packet
-    )
-
-    detection_latency_ms = (
-        get_immediate_detection_latency_ms(
-            packet
-        )
-    )
+    detection_latency_ms = get_immediate_detection_latency_ms(packet)
 
     event = create_event(
         "MAC_IDENTITY_ANOMALY",
         "high",
         bssid=bssid,
-        source_mac=source_mac,
-        frame_type=frame_type,
         expected_ssid=expected_ssid,
         observed_ssid=observed_ssid,
         expected_channel=expected_channel,
         observed_channel=observed_channel,
+        advertised_channel=advertised_channel,
         capture_channel=capture_channel,
-        rssi=rssi,
-        anomalies=anomalies,
-        detection_latency_ms=(
-            detection_latency_ms
-        ),
+        frame_type=get_frame_type(packet),
+        rssi=radio["rssi"],
+        frequency=radio["frequency"],
+        detection_latency_ms=detection_latency_ms,
     )
 
     emit_event(event)
 
-    print()
-    print("!" * 70)
-    print(
-        "[ALERT] Anomalia tożsamości AP "
-        "/ możliwy MAC spoofing"
-    )
-    print(
-        f"BSSID: {bssid}"
-    )
+    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+    print("[ALERT] Anomalia tożsamości AP / możliwy MAC spoofing")
+    print(f"BSSID: {bssid}")
+    print(f"SSID oczekiwany: {expected_ssid}")
+    print(f"SSID obserwowany: {observed_ssid}")
+    print(f"Kanał oczekiwany: {expected_channel}")
+    print(f"Kanał obserwowany: {observed_channel}")
 
-    if "ssid" in anomalies:
-        print(
-            "SSID: oczekiwano "
-            f"{expected_ssid!r}, "
-            "otrzymano "
-            f"{observed_ssid!r}"
-        )
+    if detection_latency_ms is not None:
+        print(f"Detection latency: {detection_latency_ms} ms")
 
-    if "channel" in anomalies:
-        print(
-            "Kanał: oczekiwano "
-            f"{expected_channel}, "
-            "otrzymano "
-            f"{observed_channel}"
-        )
+    print("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
 
-    print(
-        "Detection latency: "
-        f"{detection_latency_ms} ms"
-    )
-    print(
-        "Zdarzenie zapisano do: "
-        f"{EVENT_LOG}"
-    )
-    print("!" * 70)
-    print()
+
+def process_packet(packet):
+    if not packet.haslayer(Dot11):
+        return
+
+    detect_deauth_flood(packet)
+    detect_probe_flood(packet)
+    detect_rogue_ap(packet)
+    detect_mac_identity_anomaly(packet)
+
