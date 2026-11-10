@@ -213,6 +213,22 @@ def get_fragment_number(packet):
         return None
 
 
+def is_retry_frame(packet):
+    """
+    Zwraca True tylko wtedy, gdy ramka IEEE 802.11 ma ustawiony bit Retry.
+    Sam powtarzający się numer sekwencyjny nie oznacza retransmisji.
+    """
+    dot11 = packet.getlayer(Dot11)
+
+    if dot11 is None:
+        return False
+
+    try:
+        return bool(int(dot11.FCfield) & 0x08)
+    except (TypeError, ValueError):
+        return False
+
+
 def make_frame_identity(packet):
     """
     Identyfikator logicznej ramki 802.11 używany tylko do odrzucania
@@ -274,7 +290,7 @@ def detect_probe_flood(packet):
     identity = make_frame_identity(packet)
 
     # Ta sama logiczna ramka może zostać odebrana wielokrotnie jako retransmisja.
-    if queue_contains_identity(events, identity):
+    if is_retry_frame(packet) and queue_contains_identity(events, identity):
         return
 
     events.append((now, identity))
@@ -353,7 +369,7 @@ def detect_deauth_flood(packet):
 
     identity = make_frame_identity(packet)
 
-    if queue_contains_identity(events, identity):
+    if is_retry_frame(packet) and queue_contains_identity(events, identity):
         return
 
     events.append((now, identity))
@@ -569,4 +585,3 @@ def process_packet(packet):
     detect_probe_flood(packet)
     detect_rogue_ap(packet)
     detect_mac_identity_anomaly(packet)
-
