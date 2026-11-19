@@ -12,6 +12,7 @@ certs/
 # Local event logs
 events.jsonl
 baseline_*.jsonl
+mqtt_outbox.sqlite3*
 
 # Experimental measurements
 performance_*.txt
